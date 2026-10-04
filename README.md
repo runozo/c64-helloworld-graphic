@@ -2,7 +2,8 @@
 
 Versione **grafica** del classico "hello world" per C64: la scritta
 `HELLO, WORLD!` **non** viene stampata come testo, ma **disegnata pixel
-per pixel** in un bitmap hires 320x200 tramite il VIC-II.
+per pixel** in un bitmap hires 320x200 tramite il VIC-II, e **scorre
+orizzontalmente** (marquee continuo) da destra verso sinistra.
 
 - CPU: MOS 6510
 - Video: standard bitmap mode (hires), 320x200, 2 colori per cella
@@ -21,6 +22,7 @@ per pixel** in un bitmap hires 320x200 tramite il VIC-II.
 | Output | caratteri nella video-RAM | pixel nel bitmap `$2000-$3FFF` |
 | Stampa | routine KERNAL `CHROUT` (`$FFD2`) | copia di un font 8x8 nel bitmap |
 | Colori | color RAM `$D800` | video matrix `$0400` (nibble alto/basso) |
+| Animazione | nessuna | scroll orizzontale 1 pixel/frame |
 
 ## File
 
@@ -99,18 +101,54 @@ azzerato il bitmap: risultato bianco su blu.
 Il programma:
 
 1. azzera il bitmap (`$2000-$3FFF`);
-2. riempie la video matrix con `$16`;
-3. per ogni glifo del messaggio copia 8 byte dal font al bitmap
-   (`draw_glyph`);
+2. riempie la video matrix con `$16` (bianco su blu);
+3. riempie la riga di testo (riga 12) con il messaggio ripetuto
+   (`fill_line`);
 4. abilita la bitmap mode (`$D011`).
 
 Il font è una tabella 8x8 scritta a mano nel sorgente (`glyph_H`,
-`glyph_E`, ...). La tabella `message` contiene i **puntatori** ai glifi,
-terminata da una word `$0000`.
+`glyph_E`, ...). La tabella `scroll_message` contiene i **puntatori** ai
+glifi, terminata da una word `$0000`; `next_glyph` li percorre in ciclo.
 
-Il programma poi resta in un loop (`sei` + `jmp`) per mantenere l'immagine
-stabile, dato che in modalità grafica la schermata BASIC non è più
-significativa.
+### 6. Lo scroll orizzontale
+
+Il loop principale gira una volta per frame (sincronizzato alla linea
+raster 248 con `wait_frame`):
+
+```
+scroll_loop:
+        jsr wait_frame     ; una volta per frame
+        jsr shift_line     ; scorre il bitmap di 1 pixel a sinistra
+        dec frame_count
+        bne scroll_loop
+        lda #$08           ; ogni 8 pixel (1 cella)...
+        sta frame_count
+        jsr insert_char    ; ...entra un nuovo carattere da destra
+        jmp scroll_loop
+```
+
+**Attenzione al layout del bitmap:** una cella 8x8 occupa 8 byte
+*contigui*, quindi i byte di una stessa **riga di pixel** sono a distanza
+8 (uno per cella). Non si può quindi trattare la riga come un array
+lineare di 320 byte (mescolerebbe le righe di pixel e distorcerebbe i
+glifi): bisogna scorrere **riga di pixel per riga di pixel**.
+
+`shift_line` genera perciò 320 `ROL` assoluti con la direttiva `!for` di
+ACME, processando le celle da destra (39) a sinistra (0) con una catena di
+carry continua:
+
+```asm
+!for .p, 0, 7 {          ; 8 righe di pixel
+        clc
+        !for .c, 39, 0 { ; 40 celle, da destra a sinistra
+                rol line + .p + .c*8
+        }
+}
+```
+
+È veloce (nessun ciclo di indirizzamento) e sposta l'immagine di 1 pixel a
+sinistra, perdendo il pixel più a sinistra e liberando l'ultima cella a
+destra, che `insert_char` riempie con il glifo successivo.
 
 ## Sintassi ACME usata
 
@@ -120,6 +158,7 @@ significativa.
 | `!to "graphic.prg", cbm` | output PRG con load address |
 | `* = $0801` | contatore di programma |
 | `!byte`, `!word` | dati a 8 / 16 bit |
+| `!for SYM, A, B { }` | ripete un blocco (anche decrescente) |
 | `simbolo = valore` | costanti (usate per la zero page) |
 
 ## Verifica

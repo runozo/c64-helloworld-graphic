@@ -1,23 +1,28 @@
 ; =====================================================================
-;  graphic.asm  -  "HELLO, WORLD!" in MODALITA' GRAFICA (bitmap hires)
+;  graphic.asm  -  "HELLO, WORLD!" GRAFICO con SCROLLING per C64
 ; ---------------------------------------------------------------------
 ;  CPU      : MOS 6510
 ;  Assembler: ACME
 ;  Output   : graphic.prg
 ;
-;  A differenza della versione testo (che usa la KERNAL CHROUT per
-;  stampare caratteri nella video-RAM), qui NON esiste alcun carattere:
-;  il testo viene DISEGNATO come pixel in un bitmap 320x200.
+;  La scritta viene DISEGNATA come pixel in un bitmap hires 320x200 e
+;  scorre orizzontalmente da destra verso sinistra (marquee continuo).
 ;
 ;  Modalita' video: standard bitmap (hires) del VIC-II
 ;    - bitmap      : $2000-$3FFF  (8000 byte, 1 bit = 1 pixel)
-;    - video matrix: $0400-$07E7  (40x25 byte, colore per ogni cella 8x8)
+;    - video matrix: $0400-$07E7  (colore per ogni cella 8x8)
 ;    - $D018 = $18  -> matrix $0400, bitmap $2000
 ;    - $D011 = $3B  -> BMM=1 (bitmap), DEN=1, yscroll=3, 25 righe
 ;    - $D016 = $08  -> MCM=0 (hires), 40 colonne, xscroll=0
 ;
-;  In bitmap mode il byte della video matrix di ogni cella 8x8 seleziona
-;  i colori: nibble ALTO = pixel a 1, nibble BASSO = pixel a 0.
+;  Layout del bitmap: le 8 righe di pixel di una cella 8x8 sono
+;  contigue; la cella (riga R, col C) sta a  $2000 + R*320 + C*8.
+;  Per lo scroll orizzontale NON si puo' trattare la riga come un array
+;  lineare di 320 byte (i byte di una stessa riga di pixel distano 8):
+;  si scorre una riga di pixel per volta (vedi shift_line).
+;
+;  Colori: il byte della video matrix seleziona i due colori di ogni
+;  cella: nibble ALTO = pixel a 1, nibble BASSO = pixel a 0.
 ;  Usiamo $16 = bianco (1) su blu (6).
 ; =====================================================================
 
@@ -35,13 +40,22 @@ VIC_BG     = $d021
 VIC_CTRL1  = $d011
 VIC_CTRL2  = $d016
 VIC_MEM    = $d018
+VIC_RASTER = $d012
 
 ; ---------------------------------------------------------------------
 ;  Variabili in zero page (usiamo SEI, quindi la zero page e' libera)
 ; ---------------------------------------------------------------------
-zp_src   = $fb                ; puntatore al glifo (sorgente)
-zp_dst   = $fd                ; puntatore alla cella nel bitmap (destinazione)
-zp_idx   = $f7                ; indice nella tabella del messaggio
+zp_src      = $fb             ; puntatore al glifo (sorgente)
+zp_dst      = $fd             ; puntatore alla cella nel bitmap
+msg_idx     = $f7             ; indice nella tabella del messaggio
+frame_count = $f6             ; contatore frame per l'inserimento glifi
+
+; ---------------------------------------------------------------------
+;  Parametri dello scrolling
+; ---------------------------------------------------------------------
+TEXT_ROW   = 12               ; riga di caratteri (0..24)
+CELLS      = 40               ; celle per riga
+line       = BITMAP + TEXT_ROW*320
 
 ; ---------------------------------------------------------------------
 ;  BASIC stub: 10 SYS 2061 -> codice a $080D
@@ -56,14 +70,14 @@ zp_idx   = $f7                ; indice nella tabella del messaggio
 ; ---------------------------------------------------------------------
 * = $080d
 start:
-        sei                   ; ferma IRQ: schermo statico e zero page libera
+        sei                   ; ferma IRQ: timing via raster, ZP libera
         lda #$06
         sta VIC_BORDER        ; bordo blu
-        sta VIC_BG            ; sfondo blu (in bitmap non usato, per coerenza)
+        sta VIC_BG            ; sfondo blu
 
-        jsr clear_bitmap      ; bitmap tutto a 0 (nessun pixel acceso)
+        jsr clear_bitmap      ; bitmap tutto a 0
         jsr fill_screen       ; video matrix a $16 = bianco su blu
-        jsr draw_text         ; disegna i glifi nel bitmap
+        jsr fill_line         ; pre-riempe la riga col messaggio
 
         lda #$3b              ; abilita la modalita' bitmap
         sta VIC_CTRL1
@@ -72,8 +86,128 @@ start:
         lda #$18              ; matrix $0400 + bitmap $2000
         sta VIC_MEM
 
-hold:
-        jmp hold              ; resta in modalita' grafica
+        lda #$08
+        sta frame_count
+
+; ---------------------------------------------------------------------
+;  Loop principale: 1 pixel di scroll per frame; ogni 8 pixel (1 cella)
+;  entra un nuovo carattere dalla destra.
+; ---------------------------------------------------------------------
+scroll_loop:
+        jsr wait_frame
+        jsr shift_line
+        dec frame_count
+        bne scroll_loop
+        lda #$08
+        sta frame_count
+        jsr insert_char
+        jmp scroll_loop
+
+; ---------------------------------------------------------------------
+;  wait_frame: attende la linea raster 248 (una volta per frame)
+; ---------------------------------------------------------------------
+wait_frame:
+        lda #$f8
+wf_wait:
+        cmp VIC_RASTER
+        bne wf_wait
+        rts
+
+; ---------------------------------------------------------------------
+;  shift_line: scorre a sinistra di 1 pixel i 320 byte della riga.
+;  ROL propaga il bit7 di un byte nel bit0 del byte precedente, quindi
+;  si processa dal byte piu' a destra (319) al piu' a sinistra (0).
+; ---------------------------------------------------------------------
+shift_line:
+        ; Il bitmap e' interlacciato per celle: una cella 8x8 occupa 8
+        ; byte CONTIGUI, quindi i byte di una stessa riga di pixel sono a
+        ; distanza 8 (uno per cella). Uno scroll orizzontale va fatto
+        ; riga di pixel per riga di pixel (p = 0..7), scorrendo le 40
+        ; celle (c = 39..0) con ROL e catena di carry continua.
+        ; Generiamo 320 ROL assoluti con "!for": veloce e senza loop.
+        !for .p, 0, 7 {
+                clc
+                !for .c, 39, 0 {
+                        rol line + .p + .c*8
+                }
+        }
+        rts
+
+; ---------------------------------------------------------------------
+;  insert_char: disegna il prossimo glifo nell'ultima cella (destra)
+; ---------------------------------------------------------------------
+insert_char:
+        jsr next_glyph
+        lda #<(line + (CELLS-1)*8)
+        sta zp_dst
+        lda #>(line + (CELLS-1)*8)
+        sta zp_dst+1
+        jsr draw_glyph
+        rts
+
+; ---------------------------------------------------------------------
+;  fill_line: riempie le 40 celle della riga col messaggio ripetuto
+; ---------------------------------------------------------------------
+fill_line:
+        lda #<line
+        sta zp_dst
+        lda #>line
+        sta zp_dst+1
+        lda #$00
+        sta msg_idx
+        ldx #CELLS
+fl_loop:
+        jsr next_glyph
+        jsr draw_glyph
+        lda zp_dst
+        clc
+        adc #$08
+        sta zp_dst
+        bcc fl_skip
+        inc zp_dst+1
+fl_skip:
+        dex
+        bne fl_loop
+        rts
+
+; ---------------------------------------------------------------------
+;  next_glyph: mette in zp_src il prossimo glifo del messaggio e
+;  avanza msg_idx di 2. Al terminatore (word 0) riparte dall'inizio.
+;  Non modifica X (cosi' fill_line puo' usarlo come contatore).
+; ---------------------------------------------------------------------
+next_glyph:
+        ldy msg_idx
+        lda scroll_message,y
+        sta zp_src
+        lda scroll_message+1,y
+        sta zp_src+1
+        ora zp_src
+        bne ng_ok
+        ldy #$00              ; terminatore: wrap all'inizio
+        sty msg_idx
+        lda scroll_message,y
+        sta zp_src
+        lda scroll_message+1,y
+        sta zp_src+1
+ng_ok:
+        lda msg_idx
+        clc
+        adc #$02
+        sta msg_idx
+        rts
+
+; ---------------------------------------------------------------------
+;  draw_glyph: copia un glifo 8x8 da (zp_src) a (zp_dst), 8 byte
+; ---------------------------------------------------------------------
+draw_glyph:
+        ldy #$00
+dg_loop:
+        lda (zp_src),y        ; riga Y del glifo
+        sta (zp_dst),y        ; riga Y della cella nel bitmap
+        iny
+        cpy #$08
+        bne dg_loop
+        rts
 
 ; ---------------------------------------------------------------------
 ;  clear_bitmap: azzera $2000-$3FFF (32 pagine = 8192 byte)
@@ -111,76 +245,14 @@ fs_loop:
         rts
 
 ; ---------------------------------------------------------------------
-;  draw_text: per ogni glifo del messaggio copia 8 byte nel bitmap.
-;
-;  Il bitmap e' organizzato per celle 8x8: le 8 righe di pixel di una
-;  cella sono CONTIGUE (8 byte), e le celle sono nell'ordine della
-;  video matrix: cella (riga, col) = base + riga*320 + col*8.
-;  Dopo ogni glifo si avanza quindi zp_dst di 8 byte.
-; ---------------------------------------------------------------------
-draw_text:
-        lda #<text_base
-        sta zp_dst
-        lda #>text_base
-        sta zp_dst+1
-        lda #$00
-        sta zp_idx
-dt_loop:
-        ldx zp_idx
-        lda message,x         ; byte basso del puntatore al glifo
-        sta zp_src
-        lda message+1,x       ; byte alto
-        sta zp_src+1
-        ora zp_src            ; se entrambi 0 -> fine tabella
-        beq dt_done
-
-        jsr draw_glyph        ; copia gli 8 byte del glifo
-
-        lda zp_dst            ; cella successiva = base + 8
-        clc
-        adc #$08
-        sta zp_dst
-        bcc dt_skip
-        inc zp_dst+1
-dt_skip:
-        lda zp_idx            ; indice +2 (puntatori a 16 bit)
-        clc
-        adc #$02
-        sta zp_idx
-        jmp dt_loop
-dt_done:
-        rts
-
-; ---------------------------------------------------------------------
-;  draw_glyph: copia un glifo 8x8 da (zp_src) a (zp_dst), 8 byte
-; ---------------------------------------------------------------------
-draw_glyph:
-        ldy #$00
-dg_loop:
-        lda (zp_src),y        ; riga Y del glifo
-        sta (zp_dst),y        ; riga Y della cella nel bitmap
-        iny
-        cpy #$08
-        bne dg_loop
-        rts
-
-; ---------------------------------------------------------------------
-;  Posizione del testo nel bitmap: riga 12, colonna 13 (centrato)
-;  indirizzo = $2000 + 12*320 + 13*8 = $2F68
-; ---------------------------------------------------------------------
-TEXT_ROW = 12
-TEXT_COL = 13
-text_base = BITMAP + TEXT_ROW*320 + TEXT_COL*8
-
-; ---------------------------------------------------------------------
-;  Tabella del messaggio: "HELLO, WORLD!"
+;  Messaggio dello scroller: "HELLO, WORLD!" seguito da spazi.
 ;  Sequenza di puntatori (16 bit) ai glifi, terminata da una word 0.
 ; ---------------------------------------------------------------------
-message:
-        !word glyph_H, glyph_E, glyph_L, glyph_L, glyph_O
-        !word glyph_COMMA, glyph_SPACE
-        !word glyph_W, glyph_O, glyph_R, glyph_L, glyph_D
-        !word glyph_EXCL
+scroll_message:
+        !word glyph_H, glyph_E, glyph_L, glyph_L, glyph_O, glyph_COMMA
+        !word glyph_SPACE
+        !word glyph_W, glyph_O, glyph_R, glyph_L, glyph_D, glyph_EXCL
+        !word glyph_SPACE, glyph_SPACE, glyph_SPACE, glyph_SPACE
         !word $0000
 
 ; ---------------------------------------------------------------------
